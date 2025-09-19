@@ -26,7 +26,6 @@ ICON_FALLBACK = None
 # --- Sizing knobs ---
 TILE_MIN_SIDE = 96          # minimum square size for a tile
 TILE_MAX_SIDE = 220         # maximum square size for a tile
-CHOICE_BTN_MIN_W = 330   # min width we allow each follow-up option to shrink to
 CARD_SIDE_MARGINS = 16   # matches your card contents margins (left/right)
 ROW_SPACING = 10         # matches ChoiceRow spacing
 TILES_SPACING = 12       # matches tiles row spacing
@@ -505,9 +504,6 @@ class SquareTile(QPushButton):
         f = self.font(); f.setPointSize(f.pointSize() + 1); self.setFont(f)
 
 class ChoiceRow(QWidget):
-    """
-    One row of centered, evenly-sized radio-like buttons (exclusive).
-    """
     def __init__(self, on_choice):
         super().__init__()
         self.on_choice = on_choice
@@ -519,12 +515,94 @@ class ChoiceRow(QWidget):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(10)
 
+        self._wrap_mode = None  # None / "one" / "two"
+
+    def _compute_target_btn_width(self) -> int:
+        m = self.layout.contentsMargins()
+        spacing = self.layout.spacing()
+        n = max(1, len(self.buttons))
+        total_w = max(0, self.width() - m.left() - m.right() - spacing * (n - 1))
+        return total_w // n if n else total_w
+
+    def _apply_mode(self, mode: str):
+        """Set all buttons to one-line or two-line based on stored raw text."""
+        fm = self.fontMetrics()
+
+        if mode == "one":
+            for b in self.buttons:
+                raw = b.property("_raw_text") or b.text()
+                b.setText(raw)
+                b.setMinimumHeight(48)
+                b.setMaximumHeight(60)
+            self._wrap_mode = "one"
+            return
+
+        # mode == "two": split into two lines and set a taller height
+        for b in self.buttons:
+            raw = b.property("_raw_text") or b.text()
+            words = raw.split()
+            if len(words) <= 1:
+                line1, line2 = raw, ""
+            else:
+                total_chars = sum(len(w) for w in words) + (len(words) - 1)
+                half = total_chars // 2
+                cur = 0
+                cut = 0
+                for i, w in enumerate(words):
+                    cur += len(w)
+                    if cur >= half:
+                        cut = i + 1
+                        break
+                    cur += 1  # space
+                line1 = " ".join(words[:cut]).strip()
+                line2 = " ".join(words[cut:]).strip()
+            text = line1 if not line2 else f"{line1}\n{line2}"
+            b.setText(text)
+
+        h_two = fm.height() * 2 + 22
+        for b in self.buttons:
+            b.setMinimumHeight(h_two)
+            b.setMaximumHeight(h_two + 6)
+        self._wrap_mode = "two"
+
+    def _maybe_rewrap(self):
+        if not self.buttons:
+            return
+
+        fm = self.fontMetrics()
+        pad = 24
+        w_btn = self._compute_target_btn_width()
+        if w_btn <= 0:
+            return
+
+        # read raw labels (always compare against raw)
+        raw_texts = [(b.property("_raw_text") or b.text()) for b in self.buttons]
+        widths = [fm.horizontalAdvance(t) for t in raw_texts]
+
+        # directional hysteresis:
+        need_wrap = any(w > (w_btn - pad) for w in widths)           # wrap if any exceeds
+        can_unwrap = all(w < (w_btn - pad) * 0.82 for w in widths)   # unwrap only if all comfortably fit
+
+        desired = self._wrap_mode or "one"
+        if self._wrap_mode in (None, "one"):
+            desired = "two" if need_wrap else "one"
+        elif self._wrap_mode == "two":
+            desired = "one" if can_unwrap else "two"
+
+        if desired != self._wrap_mode:
+            self._apply_mode(desired)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._maybe_rewrap()
+
     def build(self, options: list[str], current_idx: int | None):
         # clear previous
         for b in self.buttons:
             self.group.removeButton(b)
             b.setParent(None)
         self.buttons = []
+        self._wrap_mode = None
 
         for i, txt in enumerate(options):
             btn = QPushButton(txt)
@@ -534,7 +612,7 @@ class ChoiceRow(QWidget):
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             btn.setMinimumHeight(48)
             btn.setMaximumHeight(60)
-            btn.setMinimumWidth(CHOICE_BTN_MIN_W)
+            btn.setProperty("_raw_text", txt)  # keep original
             self.group.addButton(btn, i)
             self.layout.addWidget(btn, 1)
             self.buttons.append(btn)
@@ -543,6 +621,10 @@ class ChoiceRow(QWidget):
             self.buttons[current_idx].setChecked(True)
 
         self.group.idToggled.connect(self._on_toggled)
+
+        # do first pass after layout settles
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._maybe_rewrap)
 
     def _on_toggled(self, idx: int, checked: bool):
         if checked:
@@ -562,7 +644,7 @@ class TaggerWindow(QMainWindow):
         self._last_start_mono = None
 
         self.setWindowTitle("Tagowanie Tweetów")
-        self.setMinimumSize(1040, 720)
+        self.setMinimumSize(800, 600)
 
         self.setStyleSheet(STYLE)
         f = QFont(); f.setPointSize(10)
@@ -593,7 +675,7 @@ class TaggerWindow(QMainWindow):
         self.act_about.triggered.connect(
             lambda: QMessageBox.information(
                 self, "O TweetTagger",
-                "TweetTagger — lekka aplikacja do adnotacji.\n© IFIS PAN"
+                "TweetTagger — lekka aplikacja do anotacji.\n© IFIS PAN"
             )
         )
 
@@ -734,27 +816,32 @@ class TaggerWindow(QMainWindow):
         self._enforce_min_window_width()
 
     def _enforce_min_window_width(self):
-        """Prevent shrinking below the width where either tiles or follow-up rows would overflow."""
-        # tiles requirement
+        """
+        Compute a sane minimum width, but never exceed the available screen width.
+        Also: now that buttons can wrap, we no longer need a huge min width.
+        """
+        # Tiles row (8 tiles) minimum: 8 * TILE_MIN_SIDE + spacings + margins
         n_tiles = len(self.tiles)
         tiles_row = (
                 ROOT_SIDE_MARGINS * 2 +
                 CARD_SIDE_MARGINS * 2 +
                 n_tiles * TILE_MIN_SIDE +
-                (n_tiles - 1) * TILES_SPACING
+                max(0, (n_tiles - 1)) * TILES_SPACING
         )
 
-        # worst follow-up row requirement: 5 buttons
-        n_btn = 5
-        followups_row = (
-                ROOT_SIDE_MARGINS * 2 +
-                CARD_SIDE_MARGINS * 2 +
-                n_btn * CHOICE_BTN_MIN_W +
-                (n_btn - 1) * ROW_SPACING
-        )
+        # Follow-up row width no longer forces 5×330 — buttons wrap.
+        # Keep a modest floor that looks OK even on small displays.
+        modest_floor = 720
 
-        required = max(tiles_row, followups_row, 800)  # 800 is a sane floor
-        # Only raise the minimum; don't force growing if the user already has a wider window.
+        required = max(tiles_row, modest_floor)
+
+        # Cap by available screen width (prevents "wider than screen" on mac)
+        scr = self.screen() or QApplication.primaryScreen()
+        if scr:
+            avail_w = scr.availableGeometry().width()
+            # Leave a tiny safety margin
+            required = min(required, max(600, int(avail_w * 0.98)))
+
         self.setMinimumWidth(int(required))
 
     def _update_detail_host_minheight(self):
@@ -1208,7 +1295,21 @@ class TaggerWindow(QMainWindow):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._resize_tiles_square()
-        self._update_detail_host_minheight()  # <— add this
+        self._update_detail_host_minheight()
+
+        # re-apply wrapping for every ChoiceRow currently on screen
+        for i in range(self.detail_vbox.count()):
+            w = self.detail_vbox.itemAt(i).widget()
+            if not w:
+                continue
+            lay = w.layout()
+            if not lay or lay.count() < 2:
+                continue
+            row = lay.itemAt(1).widget()
+            if isinstance(row, ChoiceRow):
+                # OLD: row._wrap_all_to_two_lines(max(1, row.width()))
+                row._maybe_rewrap()
+
 
 def main():
     app = QApplication(sys.argv)
