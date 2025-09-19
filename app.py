@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime
 import re, html, time
 
-from PySide6.QtCore import Qt, QSettings, QByteArray
+from PySide6.QtCore import Qt, QSettings, QByteArray, QStandardPaths
 from PySide6.QtGui import QAction, QIcon, QCloseEvent, QKeySequence, QFont, QCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -26,6 +26,11 @@ ICON_FALLBACK = None
 # --- Sizing knobs ---
 TILE_MIN_SIDE = 96          # minimum square size for a tile
 TILE_MAX_SIDE = 220         # maximum square size for a tile
+CHOICE_BTN_MIN_W = 330   # min width we allow each follow-up option to shrink to
+CARD_SIDE_MARGINS = 16   # matches your card contents margins (left/right)
+ROW_SPACING = 10         # matches ChoiceRow spacing
+TILES_SPACING = 12       # matches tiles row spacing
+ROOT_SIDE_MARGINS = 18   # matches root layout L/R margins
 
 # Categories (+ “Other”)
 LABELS = [
@@ -210,7 +215,55 @@ QPushButton#ZoomBtn {{
     min-width: 28px;
 }}
 QPushButton#ZoomBtn:hover {{ background: #1a2853; }}
+
 """
+STYLE_MENUS = """
+/* ===== Menubar (Windows/Linux in-window) ===== */
+QMenuBar {
+    background: #0f152b;
+    border-bottom: 1px solid #334155;
+}
+QMenuBar::item {
+    padding: 6px 12px;
+    margin: 2px 4px;
+    color: #e2e8f0;
+    background: transparent;
+    border-radius: 6px;
+}
+QMenuBar::item:selected { /* hover */
+    background: #1a2853;
+    color: #ffffff;
+}
+QMenuBar::item:pressed {
+    background: #233066;
+}
+
+/* ===== Dropdown menus ===== */
+QMenu {
+    background: #0f1530;
+    border: 1px solid #475569;
+    padding: 6px 0;
+}
+QMenu::separator {
+    height: 1px;
+    background: #334155;
+    margin: 6px 10px;
+}
+QMenu::item {
+    padding: 8px 18px;
+    color: #e2e8f0;
+    background: transparent;
+}
+QMenu::item:selected {      /* hover item */
+    background: #1a2853;
+    color: #ffffff;
+}
+QMenu::item:disabled {
+    color: #94a3b8;
+}
+"""
+
+STYLE = STYLE + STYLE_MENUS
 
 # ================== DB helpers & schema ==================
 def _column_exists(con, table, column) -> bool:
@@ -481,6 +534,7 @@ class ChoiceRow(QWidget):
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             btn.setMinimumHeight(48)
             btn.setMaximumHeight(60)
+            btn.setMinimumWidth(CHOICE_BTN_MIN_W)
             self.group.addButton(btn, i)
             self.layout.addWidget(btn, 1)
             self.buttons.append(btn)
@@ -519,24 +573,58 @@ class TaggerWindow(QMainWindow):
         self.setWindowIcon(icon)
 
         # Toolbar
-        tb = QToolBar("Główne", self); tb.setMovable(False); self.addToolBar(tb)
 
         self.act_import = QAction("Importuj CSV", self)
         self.act_import.setShortcut(QKeySequence("Ctrl+I"))
         self.act_import.triggered.connect(self.on_import_csv)
-        tb.addAction(self.act_import)
 
         self.act_export = QAction("Eksportuj", self)
         self.act_export.setShortcut(QKeySequence("Ctrl+E"))
         self.act_export.triggered.connect(self.on_export)
-        tb.addAction(self.act_export)
 
-        tb.addSeparator()
+        # Extra actions used in the menu bar
+        self.act_quit = QAction("Zakończ", self)
+        self.act_quit.setShortcut(QKeySequence.Quit)
+        self.act_quit.setMenuRole(QAction.QuitRole)  # macOS: moves to app menu
+        self.act_quit.triggered.connect(self.close)
+
+        self.act_about = QAction("O TweetTagger", self)
+        self.act_about.setMenuRole(QAction.AboutRole)  # macOS: moves to app menu
+        self.act_about.triggered.connect(
+            lambda: QMessageBox.information(
+                self, "O TweetTagger",
+                "TweetTagger — lekka aplikacja do adnotacji.\n© IFIS PAN"
+            )
+        )
+
+
+
+        # ---- Menu bar (native on macOS) ----
+        mb = self.menuBar()  # on macOS this becomes the system menu bar
+        # File
+        m_file = mb.addMenu("Plik")
+        m_file.addAction(self.act_import)
+        m_file.addAction(self.act_export)
+        m_file.addSeparator()
+        m_file.addAction(self.act_quit)
+
+        # Help
+        m_help = mb.addMenu("Pomoc")
+        m_help.addAction(self.act_about)
+
+        # Make it feel native on macOS, keep toolbar on other OSes
+        if sys.platform == "darwin":
+            # Use the OS menu bar (default), and hide the in-window toolbar
+            mb.setNativeMenuBar(True)
+        else:
+            # On Windows/Linux keep the toolbar (and an in-window menu if you want)
+            mb.setNativeMenuBar(False)  # visible inside the window (optional)
+
         self.status_lbl = QLabel("Brak sesji"); self.status_lbl.setObjectName("muted")
         wa = QWidgetAction(self)
         w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(8,0,8,0)
         h.addWidget(self.status_lbl); h.addStretch(1)
-        wa.setDefaultWidget(w); tb.addAction(wa)
+        wa.setDefaultWidget(w)
 
         # Central layout
         central = QWidget()
@@ -594,7 +682,7 @@ class TaggerWindow(QMainWindow):
             self.tiles[col] = tile
         root.addWidget(self.tiles_card)
 
-        # Follow-up panel (fits 3 cards; scroll only if >3)
+        # Follow-up panel (elastic height; scroll whenever content taller than viewport)
         self.detail_scroll = QScrollArea()
         self.detail_scroll.setWidgetResizable(True)
         self.detail_scroll.setFrameShape(QFrame.NoFrame)
@@ -602,21 +690,19 @@ class TaggerWindow(QMainWindow):
         self.detail_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         self.detail_host = QWidget()
+        self.detail_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)  # content reports its min height
         self.detail_vbox = QVBoxLayout(self.detail_host)
         self.detail_vbox.setContentsMargins(0, 0, 0, 0)
         self.detail_vbox.setSpacing(10)
         self.detail_scroll.setWidget(self.detail_host)
 
-        # Pre-reserve final height for 3 cards — to prevent first-click jump
-        fixed_h = self._measure_card_height_for_three()
-        self.detail_scroll.setMinimumHeight(fixed_h)
-        self.detail_scroll.setMaximumHeight(fixed_h)
-        dsp = self.detail_scroll.sizePolicy()
-        dsp.setVerticalPolicy(QSizePolicy.Fixed)
-        dsp.setHorizontalPolicy(QSizePolicy.Expanding)
-        self.detail_scroll.setSizePolicy(dsp)
+        # Give it a small base minimum so it can shrink when the window gets short.
+        # We do NOT set a large minimum or a maximum — the layout will give it extra space.
+        self.detail_scroll.setMinimumHeight(140)
 
-        root.addWidget(self.detail_scroll)
+        # Make the scroll area the ONLY vertically stretchable section:
+        # tweet_card and tiles_card remain fixed; this consumes the leftover.
+        root.addWidget(self.detail_scroll, 1)
 
         # Navigation
         nav_card = QFrame(); nav_card.setObjectName("Card")
@@ -645,6 +731,51 @@ class TaggerWindow(QMainWindow):
 
         # size the tiles nicely at start
         self._resize_tiles_square()
+        self._enforce_min_window_width()
+
+    def _enforce_min_window_width(self):
+        """Prevent shrinking below the width where either tiles or follow-up rows would overflow."""
+        # tiles requirement
+        n_tiles = len(self.tiles)
+        tiles_row = (
+                ROOT_SIDE_MARGINS * 2 +
+                CARD_SIDE_MARGINS * 2 +
+                n_tiles * TILE_MIN_SIDE +
+                (n_tiles - 1) * TILES_SPACING
+        )
+
+        # worst follow-up row requirement: 5 buttons
+        n_btn = 5
+        followups_row = (
+                ROOT_SIDE_MARGINS * 2 +
+                CARD_SIDE_MARGINS * 2 +
+                n_btn * CHOICE_BTN_MIN_W +
+                (n_btn - 1) * ROW_SPACING
+        )
+
+        required = max(tiles_row, followups_row, 800)  # 800 is a sane floor
+        # Only raise the minimum; don't force growing if the user already has a wider window.
+        self.setMinimumWidth(int(required))
+
+    def _update_detail_host_minheight(self):
+        """Make the scroll area show a vertical scrollbar whenever total content is taller than its viewport."""
+        layout = self.detail_vbox
+        if not layout:
+            return
+        m = layout.contentsMargins()
+        spacing = layout.spacing()
+
+        total = m.top() + m.bottom()
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            w = item.widget() if item else None
+            if w is not None:
+                total += w.sizeHint().height()
+                if i < layout.count() - 1:
+                    total += spacing
+
+        # Make content large enough (in minimum height sense) to trigger the scrollbar when needed
+        self.detail_host.setMinimumHeight(total)
 
     # ---------- Helpers ----------
     def _adjust_tweet_font(self, delta: int):
@@ -779,6 +910,8 @@ class TaggerWindow(QMainWindow):
 
             panel = self._make_detail_panel(qtxt, opts, cur_idx, make_cb())
             self.detail_vbox.addWidget(panel)
+        self._update_detail_host_minheight()
+        self._enforce_min_window_width()
 
         if want_intent:
             qtxt, opts = INTENT_QUESTION
@@ -986,21 +1119,56 @@ class TaggerWindow(QMainWindow):
 
     def on_export(self):
         if not self.ds_id:
-            QMessageBox.information(self, "Brak sesji", "Najpierw zaimportuj plik CSV."); return
+            QMessageBox.information(self, "Brak sesji", "Najpierw zaimportuj plik CSV.")
+            return
         self._stop_timer()
 
+        # build default filename
         cur = self.con.cursor()
         cur.execute("SELECT name FROM datasets WHERE id=?", (self.ds_id,))
         name = cur.fetchone()[0] or f"dataset_{self.ds_id}"
         default_name = os.path.splitext(name)[0] + "_annotated.csv"
 
-        out_path, _ = QFileDialog.getSaveFileName(self, "Zapisz CSV z oznaczeniami", default_name, "CSV (*.csv)")
+        # pick a safe, writable default dir
+        docs_dir = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or os.path.expanduser("~")
+        settings = QSettings(ORG_NAME, APP_NAME)
+        last_dir = settings.value("last_export_dir", docs_dir)
+        start_path = os.path.join(last_dir, default_name)
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Zapisz CSV z oznaczeniami", start_path, "CSV (*.csv)"
+        )
+
         if not out_path:
             row = get_tweet_row(self.con, self.ds_id, self.cursor)
             if row: self._start_timer(row[0])
             return
+
+        # ensure the target directory is writable
+        target_dir = os.path.dirname(out_path) or docs_dir
+        if not os.path.isdir(target_dir):
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception as e:
+                QMessageBox.critical(self, "Błąd zapisu", f"Nie można utworzyć folderu:\n{target_dir}\n\n{e}")
+                row = get_tweet_row(self.con, self.ds_id, self.cursor)
+                if row: self._start_timer(row[0])
+                return
+
+        if not os.access(target_dir, os.W_OK):
+            QMessageBox.critical(
+                self, "Błąd zapisu",
+                "Wybrany folder nie pozwala na zapis. Wybierz inny (np. Dokumenty)."
+            )
+            row = get_tweet_row(self.con, self.ds_id, self.cursor)
+            if row: self._start_timer(row[0])
+            return
+
+        # do the export
         try:
             export_dataset_to_csv(self.con, self.ds_id, out_path)
+            # remember last successful folder
+            settings.setValue("last_export_dir", target_dir)
         except Exception as e:
             QMessageBox.critical(self, "Błąd eksportu", str(e))
             row = get_tweet_row(self.con, self.ds_id, self.cursor)
@@ -1040,6 +1208,7 @@ class TaggerWindow(QMainWindow):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._resize_tiles_square()
+        self._update_detail_host_minheight()  # <— add this
 
 def main():
     app = QApplication(sys.argv)
