@@ -292,6 +292,7 @@ def ensure_db():
     # detail columns (except 'inne')
     detail_cols = ", ".join(f"{col}_detail INTEGER DEFAULT -1" for _, col in LABELS if col != "inne")
 
+    # add first_seen_at / last_seen_at columns in base schema
     cur.execute(f"""
         CREATE TABLE IF NOT EXISTS tweets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -304,6 +305,8 @@ def ensure_db():
             intent INTEGER DEFAULT -1,
             stance INTEGER DEFAULT 0,
             time_spent_ms INTEGER DEFAULT 0,
+            first_seen_at TEXT,
+            last_seen_at  TEXT,
             FOREIGN KEY(dataset_id) REFERENCES datasets(id)
         )
     """)
@@ -329,6 +332,13 @@ def ensure_db():
         con.commit()
     if not _column_exists(con, "tweets", "time_spent_ms"):
         cur.execute("ALTER TABLE tweets ADD COLUMN time_spent_ms INTEGER DEFAULT 0")
+        con.commit()
+    # NEW migrations
+    if not _column_exists(con, "tweets", "first_seen_at"):
+        cur.execute("ALTER TABLE tweets ADD COLUMN first_seen_at TEXT")
+        con.commit()
+    if not _column_exists(con, "tweets", "last_seen_at"):
+        cur.execute("ALTER TABLE tweets ADD COLUMN last_seen_at TEXT")
         con.commit()
 
     return con
@@ -396,7 +406,9 @@ def get_tweet_row(con, ds_id, idx):
         *(col for _, col in LABELS),
         *detail_cols,
         "COALESCE(intent, -1)",
-        "COALESCE(time_spent_ms,0)"
+        "COALESCE(time_spent_ms,0)",
+        "first_seen_at",
+        "last_seen_at",
     ])
     cur.execute(f"""
         SELECT id, text, annotated, {select_cols}
@@ -462,7 +474,9 @@ def export_dataset_to_csv(con, ds_id, out_path):
         *cols_db,
         *detail_cols,
         "COALESCE(intent,-1)",
-        "COALESCE(time_spent_ms,0)"
+        "COALESCE(time_spent_ms,0)",
+        "first_seen_at",
+        "last_seen_at",
     ])
     cur.execute(f"""
         SELECT {select_cols}
@@ -475,9 +489,9 @@ def export_dataset_to_csv(con, ds_id, out_path):
     headers = ["tweets"] \
         + [name for name, _ in LABELS] \
         + [f"{name}_doprecyz." for name, col in LABELS if col != "inne"] \
-        + ["Intencja", "Czas_s"]
+        + ["Intencja", "Czas_s", "First_seen_at", "Last_seen_at"]
 
-    with open(out_path, "w", encoding="utf-8", newline="") as f:
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(headers)
         for r in rows:
@@ -489,7 +503,9 @@ def export_dataset_to_csv(con, ds_id, out_path):
             intent_val = int(r[det_end])
             t_ms = int(r[det_end+1] or 0)
             t_sec = round(t_ms / 1000.0, 3)
-            w.writerow([text, *label_vals, *details_vals, intent_val, t_sec])
+            first_seen = r[det_end+2] or ""
+            last_seen  = r[det_end+3] or ""
+            w.writerow([text, *label_vals, *details_vals, intent_val, t_sec, first_seen, last_seen])
 
 # ================== UI helpers ==================
 class SquareTile(QPushButton):
@@ -679,8 +695,6 @@ class TaggerWindow(QMainWindow):
             )
         )
 
-
-
         # ---- Menu bar (native on macOS) ----
         mb = self.menuBar()  # on macOS this becomes the system menu bar
         # File
@@ -739,7 +753,7 @@ class TaggerWindow(QMainWindow):
         self.tweet_view.setOpenExternalLinks(True)
         self.tweet_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._tweet_font_pt = 12
-        self._current_tweet_text = ""  # <— add this line
+        self._current_tweet_text = ""  # <— remember plain text for zoom
         ft = QFont(self.font()); ft.setPointSize(self._tweet_font_pt); self.tweet_view.setFont(ft)
 
         tv.addWidget(self.tweet_view, 1)
@@ -876,7 +890,7 @@ class TaggerWindow(QMainWindow):
         return f'<div style="text-align:center; line-height:1.45; font-size:{self._tweet_font_pt}pt;">{esc}</div>'
 
     def _show_tweet_centered(self, text: str):
-        self._current_tweet_text = text  # <— remember the plain text
+        self._current_tweet_text = text  # remember the plain text
         esc = html.escape(text)
         esc = re.sub(r'(https?://\S+)', r'<a href="\\1">\\1</a>', esc)
         html_snippet = (
@@ -1106,6 +1120,15 @@ class TaggerWindow(QMainWindow):
         tweet_id = row[0]
         text = row[1]
 
+        # NEW: mark first time the tweet was seen
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = self.con.cursor()
+        cur.execute(
+            "UPDATE tweets SET first_seen_at = COALESCE(first_seen_at, ?) WHERE id=?",
+            (now_str, tweet_id)
+        )
+        self.con.commit()
+
         labels_count = len(LABELS)
         label_vals_seq = row[3:3+labels_count]
 
@@ -1154,6 +1177,18 @@ class TaggerWindow(QMainWindow):
         if not ok:
             QMessageBox.information(self, "Brak odpowiedzi", msg)
             return
+
+        # NEW: set last_seen_at for the tweet we are leaving (only on Next)
+        try:
+            row = get_tweet_row(self.con, self.ds_id, self.cursor)
+            if row:
+                current_tweet_id = row[0]
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur = self.con.cursor()
+                cur.execute("UPDATE tweets SET last_seen_at=? WHERE id=?", (now_str, current_tweet_id))
+                self.con.commit()
+        except Exception:
+            pass  # don’t break navigation if anything odd happens
 
         if self.cursor >= self.total - 1:
             done, total = count_annotated(self.con, self.ds_id)
