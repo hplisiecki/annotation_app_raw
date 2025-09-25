@@ -432,14 +432,17 @@ def save_labels_for(con, tweet_id, label_values: dict, mark_annotated=True):
     cur.execute(sql, vals)
     con.commit()
 
-def save_detail(con, tweet_id: int, topic_col: str, option_idx: int):
+def save_detail(con, tweet_id: int, topic_col: str, selected: set[int]):
     cur = con.cursor()
-    cur.execute(f"UPDATE tweets SET {topic_col}_detail=? , annotated=1 WHERE id=?", (int(option_idx), tweet_id))
+    cur.execute(
+        f"UPDATE tweets SET {topic_col}_detail=? , annotated=? WHERE id=?",
+        (_serialize_detail_value(selected), 1 if bool(selected) else 0, tweet_id)
+    )
     con.commit()
 
 def clear_detail(con, tweet_id: int, topic_col: str):
     cur = con.cursor()
-    cur.execute(f"UPDATE tweets SET {topic_col}_detail=-1 WHERE id=?", (tweet_id,))
+    cur.execute(f"UPDATE tweets SET {topic_col}_detail='' WHERE id=?", (tweet_id,))
     con.commit()
 
 def save_intent(con, tweet_id: int, option_idx: int):
@@ -491,6 +494,9 @@ def export_dataset_to_csv(con, ds_id, out_path):
         + [f"{name}_doprecyz." for name, col in LABELS if col != "inne"] \
         + ["Intencja", "Czas_s", "First_seen_at", "Last_seen_at"]
 
+    # map topic_col -> options to convert indices to labels
+    topic_opts = {col: DETAIL_QUESTIONS[col][1] for _, col in LABELS if col in DETAIL_QUESTIONS}
+
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(headers)
@@ -499,13 +505,87 @@ def export_dataset_to_csv(con, ds_id, out_path):
             label_vals = [int(v or 0) for v in r[1:1+len(LABELS)]]
             det_start = 1 + len(LABELS)
             det_end = det_start + len(detail_cols)
-            details_vals = [int(v) for v in r[det_start:det_end]]
+            # convert each detail TEXT value "0,2" -> "label0; label2"
+            detail_labels = []
+            for i, det_col in enumerate(detail_cols):
+                raw = r[det_start + i]
+                raw = "" if raw is None else str(raw)
+                selected = _parse_detail_value(raw)
+                topic_col = det_col.removesuffix("_detail")
+                opts = topic_opts.get(topic_col, [])
+                chosen_texts = []
+                for idx in sorted(selected):
+                    if 0 <= idx < len(opts):
+                        chosen_texts.append(opts[idx])
+                detail_labels.append("; ".join(chosen_texts))
             intent_val = int(r[det_end])
             t_ms = int(r[det_end+1] or 0)
             t_sec = round(t_ms / 1000.0, 3)
             first_seen = r[det_end+2] or ""
             last_seen  = r[det_end+3] or ""
-            w.writerow([text, *label_vals, *details_vals, intent_val, t_sec, first_seen, last_seen])
+            w.writerow([text, *label_vals, *detail_labels, intent_val, t_sec, first_seen, last_seen])
+
+
+# ---- Multi-select detail helpers ----
+def _parse_detail_value(v) -> set[int]:
+    """Accepts TEXT like '0,2' or an int; returns a set of selected indices."""
+    if v is None:
+        return set()
+    if isinstance(v, int):
+        return set([v]) if v >= 0 else set()
+    s = str(v).strip()
+    if not s:
+        return set()
+    try:
+        return set(int(x) for x in s.split(",") if x != "")
+    except Exception:
+        return set()
+
+def _serialize_detail_value(selected: set[int]) -> str:
+    """Serialize a set of ints to a stable '0,2,3' string (empty if none)."""
+    return ",".join(str(i) for i in sorted(selected)) if selected else ""
+
+def _detail_rules_for(topic_col: str, options: list[str]) -> dict:
+    """
+    Default rules:
+      - if there are 5 options and the last is 'Nie dotyczy ...':
+          mutex pairs: (0,1) and (2,3), last (4) exclusive with all.
+      - otherwise: no mutex, no 'none of the above'.
+    """
+    rules = {"mutex": [], "none_of_the_above": None}
+    if len(options) == 5 and "Nie dotyczy" in options[-1]:
+        rules["mutex"] = [(0,1), (2,3)]
+        rules["none_of_the_above"] = 4
+    return rules
+
+def _apply_rules_toggle(current: set[int], toggled: int, options: list[str]) -> set[int]:
+    """Return a new selection set after toggling 'toggled' with constraints."""
+    rules = _detail_rules_for("", options)
+    sel = set(current)
+    if toggled in sel:
+        # unselect
+        sel.remove(toggled)
+        return sel
+
+    # selecting
+    noa = rules.get("none_of_the_above")
+    if noa is not None:
+        if toggled == noa:
+            # selecting NOA -> clear all, keep only NOA
+            return {noa}
+        # selecting something else -> drop NOA
+        sel.discard(noa)
+
+    # drop mutex partner if needed
+    for a, b in rules.get("mutex", []):
+        if toggled == a and b in sel:
+            sel.remove(b)
+        elif toggled == b and a in sel:
+            sel.remove(a)
+
+    sel.add(toggled)
+    return sel
+
 
 # ================== UI helpers ==================
 class SquareTile(QPushButton):
@@ -520,19 +600,69 @@ class SquareTile(QPushButton):
         f = self.font(); f.setPointSize(f.pointSize() + 1); self.setFont(f)
 
 class ChoiceRow(QWidget):
-    def __init__(self, on_choice):
+    """
+    A row of buttons that can be exclusive (radio-like) or multi-select.
+    on_change receives either:
+      - exclusive=True  -> int index
+      - exclusive=False -> set[int] of selected indices
+    """
+    def __init__(self, on_change, *, exclusive: bool, options: list[str], preset=None):
         super().__init__()
-        self.on_choice = on_choice
-        self.group = QButtonGroup(self)
-        self.group.setExclusive(True)
+        self.on_change = on_change
+        self.exclusive = exclusive
+        self.options = options
         self.buttons: list[QPushButton] = []
+        self._wrap_mode = None
 
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(10)
 
-        self._wrap_mode = None  # None / "one" / "two"
+        # state for multi-select
+        self._selected: set[int] = set()
+        if not exclusive and preset:
+            self._selected = set(preset)
 
+        # Build buttons
+        if self.exclusive:
+            self.group = QButtonGroup(self)
+            self.group.setExclusive(True)
+        else:
+            self.group = None
+
+        for i, txt in enumerate(options):
+            btn = QPushButton(txt)
+            btn.setObjectName("ChoiceBtn")
+            btn.setCheckable(True)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            btn.setMinimumHeight(48)
+            btn.setMaximumHeight(60)
+            btn.setProperty("_raw_text", txt)
+            self.layout.addWidget(btn, 1)
+            self.buttons.append(btn)
+            if self.exclusive:
+                self.group.addButton(btn, i)
+            else:
+                btn.toggled.connect(lambda checked, idx=i: self._on_multi_toggled(idx, checked))
+
+        # preset selection
+        if self.exclusive:
+            # preset is an int or None
+            if isinstance(preset, int) and 0 <= preset < len(self.buttons):
+                self.buttons[preset].setChecked(True)
+            if hasattr(self, "group"):
+                self.group.idToggled.connect(self._on_exclusive_toggled)
+        else:
+            for i in sorted(self._selected):
+                if 0 <= i < len(self.buttons):
+                    self.buttons[i].setChecked(True)
+
+        # initial wrap pass after layout settles
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._maybe_rewrap)
+
+    # ---- wrapping (unchanged logic from your latest version) ----
     def _compute_target_btn_width(self) -> int:
         m = self.layout.contentsMargins()
         spacing = self.layout.spacing()
@@ -541,9 +671,7 @@ class ChoiceRow(QWidget):
         return total_w // n if n else total_w
 
     def _apply_mode(self, mode: str):
-        """Set all buttons to one-line or two-line based on stored raw text."""
         fm = self.fontMetrics()
-
         if mode == "one":
             for b in self.buttons:
                 raw = b.property("_raw_text") or b.text()
@@ -552,8 +680,6 @@ class ChoiceRow(QWidget):
                 b.setMaximumHeight(60)
             self._wrap_mode = "one"
             return
-
-        # mode == "two": split into two lines and set a taller height
         for b in self.buttons:
             raw = b.property("_raw_text") or b.text()
             words = raw.split()
@@ -569,12 +695,11 @@ class ChoiceRow(QWidget):
                     if cur >= half:
                         cut = i + 1
                         break
-                    cur += 1  # space
+                    cur += 1
                 line1 = " ".join(words[:cut]).strip()
                 line2 = " ".join(words[cut:]).strip()
             text = line1 if not line2 else f"{line1}\n{line2}"
             b.setText(text)
-
         h_two = fm.height() * 2 + 22
         for b in self.buttons:
             b.setMinimumHeight(h_two)
@@ -584,27 +709,20 @@ class ChoiceRow(QWidget):
     def _maybe_rewrap(self):
         if not self.buttons:
             return
-
         fm = self.fontMetrics()
         pad = 24
         w_btn = self._compute_target_btn_width()
         if w_btn <= 0:
             return
-
-        # read raw labels (always compare against raw)
         raw_texts = [(b.property("_raw_text") or b.text()) for b in self.buttons]
         widths = [fm.horizontalAdvance(t) for t in raw_texts]
-
-        # directional hysteresis:
-        need_wrap = any(w > (w_btn - pad) for w in widths)           # wrap if any exceeds
-        can_unwrap = all(w < (w_btn - pad) * 0.82 for w in widths)   # unwrap only if all comfortably fit
-
+        need_wrap = any(w > (w_btn - pad) for w in widths)
+        can_unwrap = all(w < (w_btn - pad) * 0.82 for w in widths)
         desired = self._wrap_mode or "one"
         if self._wrap_mode in (None, "one"):
             desired = "two" if need_wrap else "one"
         elif self._wrap_mode == "two":
             desired = "one" if can_unwrap else "two"
-
         if desired != self._wrap_mode:
             self._apply_mode(desired)
 
@@ -612,39 +730,24 @@ class ChoiceRow(QWidget):
         super().resizeEvent(e)
         self._maybe_rewrap()
 
-    def build(self, options: list[str], current_idx: int | None):
-        # clear previous
-        for b in self.buttons:
-            self.group.removeButton(b)
-            b.setParent(None)
-        self.buttons = []
-        self._wrap_mode = None
-
-        for i, txt in enumerate(options):
-            btn = QPushButton(txt)
-            btn.setObjectName("ChoiceBtn")
-            btn.setCheckable(True)
-            btn.setCursor(QCursor(Qt.PointingHandCursor))
-            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            btn.setMinimumHeight(48)
-            btn.setMaximumHeight(60)
-            btn.setProperty("_raw_text", txt)  # keep original
-            self.group.addButton(btn, i)
-            self.layout.addWidget(btn, 1)
-            self.buttons.append(btn)
-
-        if current_idx is not None and 0 <= current_idx < len(self.buttons):
-            self.buttons[current_idx].setChecked(True)
-
-        self.group.idToggled.connect(self._on_toggled)
-
-        # do first pass after layout settles
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self._maybe_rewrap)
-
-    def _on_toggled(self, idx: int, checked: bool):
+    # ---- selection handlers ----
+    def _on_exclusive_toggled(self, idx: int, checked: bool):
         if checked:
-            self.on_choice(idx)
+            self.on_change(idx)
+
+    def _on_multi_toggled(self, idx: int, checked: bool):
+        before = set(self._selected)
+        self._selected = _apply_rules_toggle(self._selected, idx, self.options)
+        # keep buttons in sync with rules (e.g., unticking conflicts / NOA)
+        for i, b in enumerate(self.buttons):
+            should = (i in self._selected)
+            if b.isChecked() != should:
+                b.blockSignals(True)
+                b.setChecked(should)
+                b.blockSignals(False)
+        if self._selected != before:
+            self.on_change(set(self._selected))  # send the whole set
+
 
 # ================== Main window ==================
 class TaggerWindow(QMainWindow):
@@ -947,17 +1050,20 @@ class TaggerWindow(QMainWindow):
             if w:
                 w.setParent(None)
 
-    def _make_detail_panel(self, title: str, options: list[str], current_idx: int | None, on_choice_cb):
-        card = QFrame(); card.setObjectName("Card")
-        lay = QVBoxLayout(card); lay.setContentsMargins(16, 12, 16, 10); lay.setSpacing(10)
+    def _make_detail_panel(self, title: str, options: list[str],
+                           *, exclusive: bool, preset, on_change_cb):
+        card = QFrame();
+        card.setObjectName("Card")
+        lay = QVBoxLayout(card);
+        lay.setContentsMargins(16, 12, 16, 10);
+        lay.setSpacing(10)
 
         lab = QLabel(title)
         lab.setWordWrap(True)
-        lab.setAlignment(Qt.AlignCenter)  # centered question text
+        lab.setAlignment(Qt.AlignCenter)
         lay.addWidget(lab)
 
-        row = ChoiceRow(on_choice_cb)
-        row.build(options, current_idx)
+        row = ChoiceRow(on_change_cb, exclusive=exclusive, options=options, preset=preset)
         lay.addWidget(row)
         return card
 
@@ -981,54 +1087,60 @@ class TaggerWindow(QMainWindow):
     def _rebuild_detail_panels(self):
         """Render follow-ups for all active categories (+ intent if 'inne')."""
         self._clear_detail_panels()
-
         if not self.ds_id:
             return
-
         row = get_tweet_row(self.con, self.ds_id, self.cursor)
         if not row:
             return
 
         labels_count = len(LABELS)
-        label_vals = {col: bool(v) for (col, v) in zip([c for _, c in LABELS], row[3:3 + labels_count])}
+        label_vals = {col: bool(v)
+                      for (col, v) in zip([c for _, c in LABELS], row[3:3 + labels_count])}
         detail_cols = [c for _, c in LABELS if c != "inne"]
         details_start = 3 + labels_count
-        details_vals = {}
+        details_vals: dict[str, str] = {}
         for i, det_col in enumerate(detail_cols):
-            details_vals[f"{det_col}_detail"] = int(row[details_start + i])
+            val = row[details_start + i]
+            details_vals[f"{det_col}_detail"] = "" if val is None else str(val)
         intent_val = int(row[details_start + len(detail_cols)])
 
-        active_topics = [col for col, active in label_vals.items() if active and col in DETAIL_QUESTIONS]
+        active_topics = [col for col, active in label_vals.items()
+                         if active and col in DETAIL_QUESTIONS]
         want_intent = label_vals.get("inne", False)
 
         for col in active_topics:
             qtxt, opts = DETAIL_QUESTIONS[col]
-            cur_idx = details_vals.get(f"{col}_detail", -1)
-            cur_idx = cur_idx if cur_idx >= 0 else None
+            raw = details_vals.get(f"{col}_detail", "")
+            preset_set = _parse_detail_value(raw)  # set[int]
 
-            def make_cb(topic=col):
-                return lambda idx: self._save_detail_choice(topic, idx)
+            def make_cb(topic=col, options=opts):
+                # receives set[int]
+                return lambda selected_set: self._save_detail_choice(topic, selected_set)
 
-            panel = self._make_detail_panel(qtxt, opts, cur_idx, make_cb())
+            panel = self._make_detail_panel(qtxt, opts, exclusive=False,
+                                            preset=preset_set, on_change_cb=make_cb())
             self.detail_vbox.addWidget(panel)
-        self._update_detail_host_minheight()
-        self._enforce_min_window_width()
 
         if want_intent:
             qtxt, opts = INTENT_QUESTION
             cur_idx = intent_val if intent_val >= 0 else None
-            panel = self._make_detail_panel(qtxt, opts, cur_idx, self._save_intent_choice)
+
+            panel = self._make_detail_panel(qtxt, opts, exclusive=True,
+                                            preset=cur_idx,
+                                            on_change_cb=self._save_intent_choice)
             self.detail_vbox.addWidget(panel)
 
-    # ---------- Save handlers ----------
-    def _save_detail_choice(self, topic_col: str, idx: int):
+        self._update_detail_host_minheight()
+        self._enforce_min_window_width()
+
+    def _save_detail_choice(self, topic_col: str, selected_set: set[int]):
         if self._loading or not self.ds_id:
             return
         row = get_tweet_row(self.con, self.ds_id, self.cursor)
         if not row:
             return
         tweet_id = row[0]
-        save_detail(self.con, tweet_id, topic_col, idx)
+        save_detail(self.con, tweet_id, topic_col, selected_set)
         self.refresh_progress()
 
     def _save_intent_choice(self, idx: int):
@@ -1043,34 +1155,28 @@ class TaggerWindow(QMainWindow):
 
     # ---------- Required follow-ups validation ----------
     def _validate_required_followups(self) -> tuple[bool, str]:
-        """
-        Returns (ok, message).
-        ok == False -> message explains what is missing.
-        """
         row = get_tweet_row(self.con, self.ds_id, self.cursor)
         if not row:
             return True, ""
 
         labels_count = len(LABELS)
-        vals = {col: bool(v) for (col, v) in zip([c for _, c in LABELS], row[3:3 + labels_count])}
+        vals = {col: bool(v)
+                for (col, v) in zip([c for _, c in LABELS], row[3:3 + labels_count])}
         detail_cols = [c for _, c in LABELS if c != "inne"]
         details_start = 3 + labels_count
         details_vals = {}
         for i, det_col in enumerate(detail_cols):
-            details_vals[f"{det_col}_detail"] = int(row[details_start + i])
+            details_vals[f"{det_col}_detail"] = "" if row[details_start + i] is None else str(row[details_start + i])
         intent_val = int(row[details_start + len(detail_cols)])
 
-        # check every active topic has detail set
         for col in DETAIL_QUESTIONS.keys():
             if vals.get(col, False):
-                if int(details_vals.get(f"{col}_detail", -1)) < 0:
-                    # find display name
+                raw = details_vals.get(f"{col}_detail", "")
+                if not _parse_detail_value(raw):
                     disp = next(name for name, c in LABELS if c == col)
-                    return False, f"Zaznacz odpowiedź w pytaniu doprecyzowującym dla kategorii „{disp}”."
-        # INNE -> intent required
+                    return False, f"Zaznacz co najmniej jedną odpowiedź w pytaniu doprecyzowującym dla „{disp}”."
         if vals.get("inne", False) and intent_val < 0:
             return False, "Zaznacz odpowiedź w pytaniu o główną intencję wypowiedzi (dla „INNE”)."
-
         return True, ""
 
     # ---------- Logic ----------
